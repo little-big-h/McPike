@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  On-demand MCP server for BOSS, activated by launchd when a client connects to port 5080.
+
+  Installation:
+    1. Replace /Users/hlgr/Projects/BOSS/Release/mcpass with the actual path to your boss binary.
+    2. cp com.boss.mcp.plist ~/Library/LaunchAgents/
+    3. launchctl load ~/Library/LaunchAgents/com.boss.mcp.plist
+
+  Uninstallation:
+    launchctl unload ~/Library/LaunchAgents/com.boss.mcp.plist
+
+  MCP endpoint: http://localhost:5080/mcp
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.boss.mcp</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/hlgr/Projects/McPass/build/McPass</string>
+	</array>
+
+	<!-- launchd creates a TCP socket on port 5080 and starts boss on first connection. -->
+	<key>Sockets</key>
+	<dict>
+		<key>Listeners</key>
+		<dict>
+			<key>SockFamily</key>
+			<string>IPv4</string>
+			<key>SockNodeName</key>
+			<string>127.0.0.1</string>
+			<key>SockServiceName</key>
+			<string>5080</string>
+			<key>SockType</key>
+			<string>stream</string>
+		</dict>
+	</dict>
+
+	<key>WorkingDirectory</key>
+	<string>/Users/hlgr/Projects/BOSS/Release</string>
+		<key>StandardErrorPath</key>
+	<string>/tmp/boss-mcp-error.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/boss-mcp-out.log</string>
+</dict>
+</plist>
