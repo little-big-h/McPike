@@ -23,9 +23,17 @@ static volatile sig_atomic_t g_stop = 0;
 void signal_handler(int) { g_stop = 1; }
 
 std::string handle_mcp_request(std::string const& json_body, Evaluator const& evaluator) {
-  auto const req = nlohmann::json::parse(json_body, nullptr, false);
   auto const null_id = nlohmann::json(nullptr);
-  auto const& id = req.is_discarded() ? null_id : req.value("id", null_id);
+
+  nlohmann::json req;
+  try {
+    req = nlohmann::json::parse(json_body);
+  } catch(nlohmann::json::parse_error const& e) {
+    return nlohmann::json{{"jsonrpc", "2.0"}, {"id", null_id},
+                         {"error", {{"code", -32700}, {"message", e.what()}}}}.dump();
+  }
+
+  auto const& id = req.value("id", null_id);
 
   auto make_result = [&](nlohmann::json result) {
     return nlohmann::json {{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}}.dump();
@@ -35,9 +43,6 @@ std::string handle_mcp_request(std::string const& json_body, Evaluator const& ev
         {"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}}
         .dump();
   };
-
-  if(req.is_discarded())
-    return make_error(-32700, "Parse error");
 
   std::string const method = req.value("method", "");
 
