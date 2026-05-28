@@ -84,7 +84,9 @@ Message types (Garmin FIT protocol spec columns):
 - `(Slice table offset count)` — zero-based row slice; **use instead of `Head` to limit results** (`Head` does not reduce output size)
 - `(Cumulate table (AggFn col))` — running/prefix aggregate
 - `(Pairwise table out-col in-col lag)` — sliding delta: `out[i] = in[i+lag] - in[i]`
-- `(Join left (List key...) right (List key...))` / `LeftJoin` / `AntiJoin` — hash joins; colliding non-key columns get `_l`/`_r` suffixes
+- `(Join left right pred ...)` — hash join; one or more `(Equal lCol rCol)` predicates define equi-join keys; additional predicates (e.g. `(Between valCol loCol hiCol)`) are ANDed as a residual filter after the hash lookup; colliding column names get `_l`/`_r` suffixes. **Warning:** omitting all `Equal` predicates degrades to an O(n²) cross-join.
+- `(LeftJoin left right pred ...)` — left outer hash join; same predicate syntax as `Join`
+- `(AntiJoin left right pred ...)` — left anti join — rows in `left` with no match in `right`; same predicate syntax as `Join`
 - `(Name table sym)` / `(ByName sym)` — store/retrieve named tables; **persists across calls**
 - `(Load "/path/to.csv")` — load a CSV file
 - `(Table (col val...)...)` — construct a literal in-memory table
