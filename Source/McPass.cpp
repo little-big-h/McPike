@@ -58,7 +58,8 @@ std::string handle_mcp_request(std::string const& json_body, Evaluator const& ev
   if(method == "tools/list") {
     nlohmann::json tool;
     tool["name"] = "evaluate";
-    tool["description"] = R"(Evaluate a BOSS expression and return the result.
+    EvalResult const ops = evaluator("(GetEngineDescription)");
+    tool["description"] = std::string(R"(Evaluate a BOSS expression and return the result.
 
 **Loading FIT workout data:**
 - `(LoadFIT "/path/to/dir")` — summary table, one row per `.fit` file; columns: `file`, `time_created`, `start_time`, `sport`, `total_elapsed_time` (seconds), `total_distance` (metres), `total_calories`
@@ -75,23 +76,7 @@ Message types (Garmin FIT protocol spec columns):
 
 **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent — use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be — for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `LoadFIT` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants `‐`/`‑`/`–`/`—`. Discover the row with `(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 1)`.
 
-**Operators:**
-- `(Schema table)` — list column names
-- `(Project table col... (As expr alias)...)` — select/derive columns; **`As` takes expression first, alias second**; arithmetic uses full Arrow compute function names: `Multiply`, `Divide`, `Add`, `Subtract` — **not** `*`/`/`/`+`/`-`
-- `(Filter table pred)` — filter rows; supports full Arrow compute set: `Equal`, `Greater`, `GreaterEqual`, `Less`, `LessEqual`, `And`, `Or`, `Not`, `IsNull`, `IsValid`, etc.
-- `(GroupBy table (AggFn col) [key...])` — aggregate; **`AggFn` takes a column name (symbol), not an expression** — derive columns with `Project` first; supports full Arrow aggregation set: `Sum`, `Mean`, `Max`, `Min`, `Count`, `CountAll`, `StdDev`, `Variance`, etc.
-- `(OrderBy table (List col... (Desc col)...))` — sort; wrap in `(Desc col)` for descending
-- `(Slice table offset count)` — zero-based row slice; **use instead of `Head` to limit results** (`Head` does not reduce output size)
-- `(Cumulate table (AggFn col))` — running/prefix aggregate
-- `(Pairwise table out-col in-col lag)` — sliding delta: `out[i] = in[i+lag] - in[i]`
-- `(Join left right pred ...)` — hash join; one or more `(Equal lCol rCol)` predicates define equi-join keys; additional predicates (e.g. `(Between valCol loCol hiCol)`) are ANDed as a residual filter after the hash lookup; colliding column names get `_l`/`_r` suffixes. **Warning:** omitting all `Equal` predicates degrades to an O(n²) cross-join.
-- `(LeftJoin left right pred ...)` — left outer hash join; same predicate syntax as `Join`
-- `(AntiJoin left right pred ...)` — left anti join — rows in `left` with no match in `right`; same predicate syntax as `Join`
-- `(Name table sym)` / `(ByName sym)` — store/retrieve named tables; **persists across calls**
-- `(Load "/path/to.csv")` — load a CSV file
-- `(Table (col val...)...)` — construct a literal in-memory table
-- `(Materialize table)` — force chunked Arrow arrays into a single contiguous buffer
-- `(ToStatus table)` — evaluate pipeline, return `"OK"` (useful for profiling)
+)") + (ops.is_error ? "" : ops.text) + R"(
 
 **Key patterns:**
 ```
