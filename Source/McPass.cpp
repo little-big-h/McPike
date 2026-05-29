@@ -81,6 +81,7 @@ Message types (Garmin FIT protocol spec columns):
 
 **Unicode in filenames:** Raw UTF-8 and JSON `\uXXXX` escapes are both accepted and equivalent — use whichever your client emits naturally. The real hazard is *invisible* Unicode: filenames produced by Apple devices commonly contain U+00A0 (non-breaking space) where a regular space appears to be — for instance, between "Apple" and "Watch" in Apple Watch export filenames. NBSP renders identically to a regular space everywhere, including in the `file` column returned by the directory-summary query, so it cannot be detected by sight. If `LoadFIT` reports `cannot open file` on a path that *visually* matches the directory listing, write the suspect gaps explicitly as `\u00a0` and retry. The same caution applies to U+200B (zero-width space), U+00AD (soft hyphen), and the Unicode dash variants `‐`/`‑`/`–`/`—`. Discover the row with `(Slice (OrderBy (LoadFIT ".../dir") (List (Desc time_created))) 0 1)`.
 
+## Supported Operators
 )") + ops_text + R"(
 
 **Key patterns:**
