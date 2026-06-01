@@ -18,7 +18,7 @@ cmake --build build
 By default the build clones `symbol-store/BOSS` at `main` via CMake `ExternalProject` and builds it into `build/boss-build/`. Override with:
 - `-DBOSS_GIT_TAG=<branch|tag|commit>` — build a different BOSS revision.
 - `-DBOSS_SOURCE_DIR=/path/to/BOSS` — reuse an existing local BOSS checkout (built in `<dir>/Release`) instead of cloning; useful for offline work or BOSS co-development.
-- `-DBOSS_BUILD_ENGINES="ns/Engine:branch;..."` — forwarded to the BOSS sub-build so BOSS clones+builds those engines (add `-DGITHUB_TOKEN=...`, or set `$GITHUB_TOKEN`, for private engine repos).
+- `-DBOSS_DEFAULT_ENGINES="FITSDKEngine;ArrowComputeEngine"` — semicolon-separated engine names, forwarded to the BOSS sub-build so BOSS builds those engines. (`-DBOSS_BUILD_ENGINES="ns/Engine:branch;..."` is also forwarded for the repo-spec form; add `-DGITHUB_TOKEN=...`, or set `$GITHUB_TOKEN`, for private engine repos.)
 
 Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies are fetched automatically via `ExternalProject` into `~/.cmake-downloads/McPass` and built into `build/deps/`.
 

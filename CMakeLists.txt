@@ -12,8 +12,10 @@ set(BOSS_GIT_REPOSITORY "https://github.com/symbol-store/BOSS"
 set(BOSS_GIT_TAG "main" CACHE STRING "BOSS branch/tag/commit to build")
 set(BOSS_SOURCE_DIR "" CACHE PATH
   "Optional existing BOSS checkout (built in <dir>/Release); skips cloning")
+set(BOSS_DEFAULT_ENGINES "" CACHE STRING
+  "Engines to build into BOSS, forwarded to the BOSS sub-build (e.g. \"FITSDKEngine;ArrowComputeEngine\")")
 set(BOSS_BUILD_ENGINES "" CACHE STRING
-  "Engines to build, forwarded to the BOSS sub-build (Namespace/Name:Branch list)")
+  "Engine repos to clone+build, forwarded to the BOSS sub-build (Namespace/Name:Branch list)")
 set(GITHUB_TOKEN "$ENV{GITHUB_TOKEN}" CACHE STRING
   "GitHub token forwarded to BOSS for fetching private engines (optional)")
 
@@ -29,7 +31,8 @@ else()
   # nlohmann-json are vendored below.
   set(BOSS_SRC_DIR "${CMAKE_BINARY_DIR}/boss-src")
   set(BOSS_BUILD_DIR "${CMAKE_BINARY_DIR}/boss-build")
-  # CMAKE_ARGS splits on ';', so re-encode the engine list with LIST_SEPARATOR.
+  # CMAKE_ARGS splits on ';', so re-encode the engine lists with LIST_SEPARATOR.
+  string(REPLACE ";" "|" BOSS_DEFAULT_ENGINES_ARG "${BOSS_DEFAULT_ENGINES}")
   string(REPLACE ";" "|" BOSS_BUILD_ENGINES_ARG "${BOSS_BUILD_ENGINES}")
   ExternalProject_Add(BOSS
     GIT_REPOSITORY ${BOSS_GIT_REPOSITORY}
@@ -43,6 +46,7 @@ else()
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DBOSS_DEFAULT_ENGINES=${BOSS_DEFAULT_ENGINES_ARG}
       -DBOSS_BUILD_ENGINES=${BOSS_BUILD_ENGINES_ARG}
       -DGITHUB_TOKEN=${GITHUB_TOKEN}
     INSTALL_COMMAND ""
