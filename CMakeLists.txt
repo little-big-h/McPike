@@ -3,13 +3,60 @@ project(McPass)
 
 include(ExternalProject)
 
-set(BOSS_SOURCE_DIR "" CACHE PATH "Path to BOSS source tree")
-if(NOT BOSS_SOURCE_DIR)
-  message(FATAL_ERROR "BOSS_SOURCE_DIR must be set to the BOSS source directory")
-endif()
-set(BOSS_BINARY_DIR "${BOSS_SOURCE_DIR}/Release" CACHE PATH "Path to BOSS build directory")
+# --- BOSS dependency -------------------------------------------------------
+# By default, clone and build BOSS from GitHub (mirroring how BOSS itself pulls
+# its engines). For local development against an existing BOSS checkout, pass
+# -DBOSS_SOURCE_DIR=/path/to/BOSS (built in <dir>/Release) to skip cloning.
+set(BOSS_GIT_REPOSITORY "https://github.com/symbol-store/BOSS"
+  CACHE STRING "BOSS git repository to fetch")
+set(BOSS_GIT_TAG "main" CACHE STRING "BOSS branch/tag/commit to build")
+set(BOSS_SOURCE_DIR "" CACHE PATH
+  "Optional existing BOSS checkout (built in <dir>/Release); skips cloning")
+set(BOSS_BUILD_ENGINES "" CACHE STRING
+  "Engines to build, forwarded to the BOSS sub-build (Namespace/Name:Branch list)")
+set(GITHUB_TOKEN "$ENV{GITHUB_TOKEN}" CACHE STRING
+  "GitHub token forwarded to BOSS for fetching private engines (optional)")
 
 find_program(MAKE_EXECUTABLE NAMES gmake mingw32-make make NAMES_PER_DIR DOC "GNU Make")
+
+if(BOSS_SOURCE_DIR)
+  # Use an existing local BOSS checkout, already built in <dir>/Release.
+  set(BOSS_SRC_DIR "${BOSS_SOURCE_DIR}")
+  set(BOSS_BUILD_DIR "${BOSS_SOURCE_DIR}/Release")
+  set(BOSS_FETCHED FALSE)
+else()
+  # Clone and build BOSS via ExternalProject, the same way libmicrohttpd and
+  # nlohmann-json are vendored below.
+  set(BOSS_SRC_DIR "${CMAKE_BINARY_DIR}/boss-src")
+  set(BOSS_BUILD_DIR "${CMAKE_BINARY_DIR}/boss-build")
+  # CMAKE_ARGS splits on ';', so re-encode the engine list with LIST_SEPARATOR.
+  string(REPLACE ";" "|" BOSS_BUILD_ENGINES_ARG "${BOSS_BUILD_ENGINES}")
+  ExternalProject_Add(BOSS
+    GIT_REPOSITORY ${BOSS_GIT_REPOSITORY}
+    GIT_TAG ${BOSS_GIT_TAG}
+    GIT_SHALLOW TRUE
+    DOWNLOAD_DIR $ENV{HOME}/.cmake-downloads/${CMAKE_PROJECT_NAME}
+    SOURCE_DIR ${BOSS_SRC_DIR}
+    BINARY_DIR ${BOSS_BUILD_DIR}
+    LIST_SEPARATOR "|"
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+      -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+      -DBOSS_BUILD_ENGINES=${BOSS_BUILD_ENGINES_ARG}
+      -DGITHUB_TOKEN=${GITHUB_TOKEN}
+    INSTALL_COMMAND ""
+    BUILD_BYPRODUCTS
+      ${BOSS_BUILD_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}BOSS${CMAKE_SHARED_LIBRARY_SUFFIX}
+      ${BOSS_BUILD_DIR}/deps/lib/${CMAKE_STATIC_LIBRARY_PREFIX}chibi-scheme${CMAKE_STATIC_LIBRARY_SUFFIX}
+  )
+  set(BOSS_FETCHED TRUE)
+endif()
+
+set(BOSS_LIBRARY
+  ${BOSS_BUILD_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}BOSS${CMAKE_SHARED_LIBRARY_SUFFIX})
+set(CHIBI_LIBRARY
+  ${BOSS_BUILD_DIR}/deps/lib/${CMAKE_STATIC_LIBRARY_PREFIX}chibi-scheme${CMAKE_STATIC_LIBRARY_SUFFIX})
 
 ExternalProject_Add(libmicrohttpd
   URL https://ftp.gnu.org/gnu/libmicrohttpd/libmicrohttpd-0.9.77.tar.gz
@@ -45,30 +92,29 @@ ExternalProject_Add(nlohmann-json
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-find_library(BOSS_LIBRARY
-  NAMES BOSS
-  HINTS ${BOSS_BINARY_DIR}
-  REQUIRED)
-
 add_executable(McPass Source/McPass.cpp)
 add_dependencies(McPass libmicrohttpd nlohmann-json)
+if(BOSS_FETCHED)
+  add_dependencies(McPass BOSS)
+endif()
 
 target_include_directories(McPass PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Source)
 target_include_directories(McPass SYSTEM PRIVATE
-  ${BOSS_SOURCE_DIR}/Source
-  ${BOSS_BINARY_DIR}/deps/include
+  ${BOSS_SRC_DIR}/Source
+  ${BOSS_BUILD_DIR}/deps/include
   ${CMAKE_BINARY_DIR}/deps/include)
 
 target_link_libraries(McPass
   ${BOSS_LIBRARY}
-  ${BOSS_BINARY_DIR}/deps/lib/${CMAKE_STATIC_LIBRARY_PREFIX}chibi-scheme${CMAKE_STATIC_LIBRARY_SUFFIX}
+  ${CHIBI_LIBRARY}
   ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd.a
   Threads::Threads)
 
 set_target_properties(McPass PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
-  CXX_EXTENSIONS OFF)
+  CXX_EXTENSIONS OFF
+  BUILD_RPATH ${BOSS_BUILD_DIR})
 
 if(APPLE)
   target_link_libraries(McPass "-Wl,-export_dynamic")
