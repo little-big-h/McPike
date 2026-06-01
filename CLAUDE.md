@@ -27,10 +27,12 @@ Dependencies (`libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3) are fetched aut
 
 - **`ExpressionParser.hpp`** --- included from `${BOSS_SOURCE_DIR}/Source` (not in this repo). Provides `boss::initialize_boss_context`, `boss::BossContextGuard`, `boss::evaluate_expression`, and `boss::EvalResult`.
 
-- **`launchd/com.boss.mcp.plist`** --- macOS launchd agent for on-demand socket activation on port 5080. Install to `~/Library/LaunchAgents/` and update the binary path before loading.
+- **`launchd/com.boss.mcp.plist`** --- macOS launchd agent for on-demand socket activation on port 5080. Install to `~/Library/LaunchAgents/` and update the binary path before loading. The socket's `Bonjour` key makes launchd advertise it over multicast DNS as `_mcp._tcp.local` (loopback-only reachability), even while the process is dormant.
 
 ## MCP endpoint
 
 `POST http://localhost:5080/mcp` (or `/`)
 Protocol version: `2024-11-05`
 Single tool: `evaluate` with one required string argument `expression`.
+
+The on-demand launchd instance is discoverable via Bonjour/mDNS as `_mcp._tcp.local` (port 5080, loopback-only). Note that Claude has no native mDNS discovery, so register it with a fixed URL: `claude mcp add --transport http mcpike http://localhost:5080/mcp`.

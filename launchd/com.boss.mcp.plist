@@ -12,6 +12,14 @@
     launchctl unload ~/Library/LaunchAgents/com.boss.mcp.plist
 
   MCP endpoint: http://localhost:5080/mcp
+
+  mDNS discovery: launchd advertises the listening socket over multicast DNS
+  (Bonjour) as _mcp._tcp.local, even while the process is dormant. Browse and
+  resolve it with:
+    dns-sd -B _mcp._tcp
+    dns-sd -L "<ComputerName>" _mcp._tcp local
+  Reachability is loopback-only (SockNodeName 127.0.0.1): the service is
+  advertised on the LAN but only connectable from this Mac.
 -->
 <plist version="1.0">
 <dict>
@@ -36,6 +44,10 @@
 			<string>5080</string>
 			<key>SockType</key>
 			<string>stream</string>
+			<!-- Advertise this socket over multicast DNS as _mcp._tcp.local.
+			     The _tcp transport is inferred from SockType=stream. -->
+			<key>Bonjour</key>
+			<string>mcp</string>
 		</dict>
 	</dict>
 
