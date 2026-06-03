@@ -28,7 +28,7 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/hlgr/Projects/McPike/build/McPike</string>
+		<string>/Users/hlgr/Projects/McPike/Build/McPike</string>
 	</array>
 
 	<!-- launchd creates a TCP socket on port 5080 and starts boss on first connection. -->
@@ -52,7 +52,7 @@
 	</dict>
 
 	<key>WorkingDirectory</key>
-	<string>/Users/hlgr/Projects/BOSS/Release</string>
+	<string>/Users/hlgr/Projects/McPike/Build</string>
 		<key>StandardErrorPath</key>
 	<string>/tmp/boss-mcp-error.log</string>
 	<key>StandardOutPath</key>
