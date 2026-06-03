@@ -30,18 +30,18 @@ std::string handle_mcp_request(std::string const& json_body, Evaluator const& ev
     req = nlohmann::json::parse(json_body);
   } catch(nlohmann::json::parse_error const& e) {
     return nlohmann::json{{"jsonrpc", "2.0"}, {"id", null_id},
-                         {"error", {{"code", -32700}, {"message", e.what()}}}}.dump();
+                         {"error", {{"code", -32700}, {"message", e.what()}}}}.dump(-1, ' ', true);
   }
 
   auto const& id = req.value("id", null_id);
 
   auto make_result = [&](nlohmann::json result) {
-    return nlohmann::json {{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}}.dump();
+    return nlohmann::json {{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}}.dump(-1, ' ', true);
   };
   auto make_error = [&](int code, std::string_view message) {
     return nlohmann::json {
         {"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}}
-        .dump();
+        .dump(-1, ' ', true);
   };
 
   std::string const method = req.value("method", "");
