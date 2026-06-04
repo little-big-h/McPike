@@ -4,7 +4,7 @@
   On-demand MCP server for BOSS, activated by launchd when a client connects to port 5080.
 
   Installation:
-    1. Replace /Users/hlgr/Projects/BOSS/Release/mcpass with the actual path to your boss binary.
+    1. Replace /Users/hlgr/Projects/BOSS/Release/mcpike with the actual path to your boss binary.
     2. cp com.boss.mcp.plist ~/Library/LaunchAgents/
     3. launchctl load ~/Library/LaunchAgents/com.boss.mcp.plist
 
@@ -28,7 +28,7 @@
 
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/hlgr/Projects/McPass/build/McPass</string>
+		<string>/Users/hlgr/Projects/McPike/build/McPike</string>
 	</array>
 
 	<!-- launchd creates a TCP socket on port 5080 and starts boss on first connection. -->

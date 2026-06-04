@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(McPass)
+project(McPike)
 
 include(ExternalProject)
 
@@ -96,36 +96,36 @@ ExternalProject_Add(nlohmann-json
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
-add_executable(McPass Source/McPass.cpp)
-add_dependencies(McPass libmicrohttpd nlohmann-json)
+add_executable(McPike Source/McPike.cpp)
+add_dependencies(McPike libmicrohttpd nlohmann-json)
 if(BOSS_FETCHED)
-  add_dependencies(McPass BOSS)
+  add_dependencies(McPike BOSS)
 endif()
 
-target_include_directories(McPass PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Source)
-target_include_directories(McPass SYSTEM PRIVATE
+target_include_directories(McPike PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/Source)
+target_include_directories(McPike SYSTEM PRIVATE
   ${BOSS_SRC_DIR}/Source
   ${BOSS_BUILD_DIR}/deps/include
   ${CMAKE_BINARY_DIR}/deps/include)
 
-target_link_libraries(McPass
+target_link_libraries(McPike
   ${BOSS_LIBRARY}
   ${CHIBI_LIBRARY}
   ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd.a
   Threads::Threads)
 
-set_target_properties(McPass PROPERTIES
+set_target_properties(McPike PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
   BUILD_RPATH ${BOSS_BUILD_DIR})
 
 if(APPLE)
-  target_link_libraries(McPass "-Wl,-export_dynamic")
+  target_link_libraries(McPike "-Wl,-export_dynamic")
 endif()
 if(UNIX AND NOT APPLE)
-  target_link_libraries(McPass dl rt)
+  target_link_libraries(McPike dl rt)
 endif()
 
-install(TARGETS McPass RUNTIME DESTINATION bin)
-install(DIRECTORY launchd DESTINATION share/McPass)
+install(TARGETS McPike RUNTIME DESTINATION bin)
+install(DIRECTORY launchd DESTINATION share/McPike)
