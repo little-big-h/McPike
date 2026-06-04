@@ -3,6 +3,10 @@ project(McPike)
 
 include(ExternalProject)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 # --- BOSS dependency -------------------------------------------------------
 # By default, clone and build BOSS from GitHub (mirroring how BOSS itself pulls
 # its engines). For local development against an existing BOSS checkout, pass
@@ -43,7 +47,7 @@ else()
     BINARY_DIR ${BOSS_BUILD_DIR}
     LIST_SEPARATOR "|"
     CMAKE_ARGS
-      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
       -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
       -DBOSS_DEFAULT_ENGINES=${BOSS_DEFAULT_ENGINES_ARG}
