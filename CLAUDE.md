@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-McPass is a minimal MCP (Model Context Protocol) HTTP server that wraps the BOSS query-evaluation engine. It exposes a single MCP tool (`evaluate`) that accepts a BOSS expression string and returns the result. The entire server is one C++17 source file (`Source/McPass.cpp`).
+McPike is a minimal MCP (Model Context Protocol) HTTP server that wraps the BOSS query-evaluation engine. It exposes a single MCP tool (`evaluate`) that accepts a BOSS expression string and returns the result. The entire server is one C++17 source file (`Source/McPike.cpp`).
 
 ## Build
 
@@ -20,11 +20,11 @@ By default the build clones `symbol-store/BOSS` at `main` via CMake `ExternalPro
 - `-DBOSS_SOURCE_DIR=/path/to/BOSS` — reuse an existing local BOSS checkout (built in `<dir>/Release`) instead of cloning; useful for offline work or BOSS co-development.
 - `-DBOSS_DEFAULT_ENGINES="FITSDKEngine;ArrowComputeEngine"` — semicolon-separated engine names, forwarded to the BOSS sub-build so BOSS builds those engines. (`-DBOSS_BUILD_ENGINES="ns/Engine:branch;..."` is also forwarded for the repo-spec form; add `-DGITHUB_TOKEN=...`, or set `$GITHUB_TOKEN`, for private engine repos.)
 
-Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies are fetched automatically via `ExternalProject` into `~/.cmake-downloads/McPass` and built into `build/deps/`.
+Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies are fetched automatically via `ExternalProject` into `~/.cmake-downloads/McPike` and built into `build/deps/`.
 
 ## Architecture
 
-- **`Source/McPass.cpp`** --- the entire server. Key layers top to bottom:
+- **`Source/McPike.cpp`** --- the entire server. Key layers top to bottom:
   - `handle_mcp_request()` --- parses JSON-RPC 2.0 and dispatches `initialize`, `tools/list`, and `tools/call` (the only real tool: `evaluate`). Returns empty string for notification methods (-> 204 No Content).
   - `handle_http_request()` / `request_completed()` --- libmicrohttpd callbacks. Accumulates POST body in `RequestState`, then calls `handle_mcp_request`. Only `/` and `/mcp` paths accept POST; everything else is 404.
   - `run_server()` --- starts `MHD_Daemon` in select-mode. On macOS, tries `launch_activate_socket` first (launchd on-demand activation on port 5080); falls back to binding `127.0.0.1:5080` directly. Runs the `select` loop until SIGTERM/SIGINT.
