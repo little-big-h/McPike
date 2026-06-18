@@ -35,6 +35,22 @@ else()
   # nlohmann-json are vendored below.
   set(BOSS_SRC_DIR "${CMAKE_BINARY_DIR}/boss-src")
   set(BOSS_BUILD_DIR "${CMAKE_BINARY_DIR}/boss-build")
+  # BOSS hardcodes the symbol-store/ namespace for BOSS_DEFAULT_ENGINES entries,
+  # so a repo-spec like "ns/Engine[:branch]" would be mis-built as
+  # symbol-store/ns/Engine and the shared-module path would contain a slash.
+  # Split such entries: keep the bare engine name in BOSS_DEFAULT_ENGINES and
+  # route the full spec via BOSS_BUILD_ENGINES, where BOSS parses ns/name:branch.
+  set(_default_engines_translated "")
+  foreach(_eng IN LISTS BOSS_DEFAULT_ENGINES)
+    if(_eng MATCHES "/")
+      string(REGEX REPLACE "[^/]+/([^:]+):?.*" "\\1" _eng_name "${_eng}")
+      list(APPEND _default_engines_translated "${_eng_name}")
+      list(APPEND BOSS_BUILD_ENGINES "${_eng}")
+    else()
+      list(APPEND _default_engines_translated "${_eng}")
+    endif()
+  endforeach()
+  set(BOSS_DEFAULT_ENGINES "${_default_engines_translated}")
   # CMAKE_ARGS splits on ';', so re-encode the engine lists with LIST_SEPARATOR.
   string(REPLACE ";" "|" BOSS_DEFAULT_ENGINES_ARG "${BOSS_DEFAULT_ENGINES}")
   string(REPLACE ";" "|" BOSS_BUILD_ENGINES_ARG "${BOSS_BUILD_ENGINES}")
@@ -46,6 +62,9 @@ else()
     SOURCE_DIR ${BOSS_SRC_DIR}
     BINARY_DIR ${BOSS_BUILD_DIR}
     LIST_SEPARATOR "|"
+    PATCH_COMMAND ${CMAKE_COMMAND}
+      -DBOSS_CMAKELISTS=${BOSS_SRC_DIR}/CMakeLists.txt
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchBOSSDefaultEngines.cmake
     CMAKE_ARGS
       -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
       -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}

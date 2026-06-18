@@ -18,7 +18,7 @@ cmake --build build
 By default the build clones `symbol-store/BOSS` at `main` via CMake `ExternalProject` and builds it into `build/boss-build/`. Override with:
 - `-DBOSS_GIT_TAG=<branch|tag|commit>` — build a different BOSS revision.
 - `-DBOSS_SOURCE_DIR=/path/to/BOSS` — reuse an existing local BOSS checkout (built in `<dir>/Release`) instead of cloning; useful for offline work or BOSS co-development.
-- `-DBOSS_DEFAULT_ENGINES="FITSDKEngine;ArrowComputeEngine"` — semicolon-separated engine names, forwarded to the BOSS sub-build so BOSS builds those engines. (`-DBOSS_BUILD_ENGINES="ns/Engine:branch;..."` is also forwarded for the repo-spec form; add `-DGITHUB_TOKEN=...`, or set `$GITHUB_TOKEN`, for private engine repos.)
+- `-DBOSS_DEFAULT_ENGINES="FITSDKEngine;ArrowComputeEngine"` — semicolon-separated engine names, forwarded to the BOSS sub-build so BOSS builds those engines. Entries may also use the repo-spec form `Namespace/Engine[:Branch]` (e.g. `another-org/MyEngine:dev`) to pull a default engine from outside the `symbol-store` org — McPike forwards the bare name to BOSS's `BOSS_DEFAULT_ENGINES` and routes the full spec via `BOSS_BUILD_ENGINES`, and BOSS is patched (`cmake/PatchBOSSDefaultEngines.cmake`) to skip its `symbol-store/`-prefix auto-add when the engine is already represented. (`-DBOSS_BUILD_ENGINES="ns/Engine:branch;..."` is also forwarded directly for engines that should be built but not default-loaded; add `-DGITHUB_TOKEN=...`, or set `$GITHUB_TOKEN`, for private engine repos.)
 
 Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies are fetched automatically via `ExternalProject` into `~/.cmake-downloads/McPike` and built into `build/deps/`.
 
