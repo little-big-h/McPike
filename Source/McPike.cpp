@@ -139,6 +139,7 @@ namespace ContentType {
 constexpr auto plain = "text/plain";
 constexpr auto json = "application/json";
 constexpr auto html = "text/html; charset=utf-8";
+constexpr auto binary = "application/octet-stream";
 } // namespace ContentType
 
 namespace JSONRPCError {
@@ -323,23 +324,64 @@ sexp pathNodeToSexp(sexp ctx, std::vector<PathNode> const& pool, size_t index) {
   return lst;
 }
 
-/// Evaluate a pre-built datum and serialise the result. Mirrors boss::evaluate_expression
-/// but skips the string reader: boss::eval_expr wraps the datum in (boss-eval ...) and runs
-/// it, exactly as the string path does after sexp_read.
-/// Keep this result-serialisation tail in sync with boss::evaluate_expression.
-boss::EvalResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
+struct DatumResult {
+  bool isError;
+  bool isBinary;
+  std::string body;
+};
+
+/**
+ * @brief Evaluate a pre-built datum and produce the browser response body.
+ *
+ * A (Binary :spans <bytevector>...) result is returned as its span bytevectors
+ * concatenated verbatim (raw binary); anything else is serialised to text via
+ * boss-print. The text/error tail mirrors boss::evaluate_expression (keep them in
+ * sync); boss::eval_expr wraps the datum in (boss-eval ...), exactly as the string
+ * path does after sexp_read.
+ */
+DatumResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
   boss::concurrency::ConcurrencyTripwire const tripwire(ctx, "evaluateDatum");
   sexp_gc_var4(result, out_port, result_str, arg_list);
   sexp_gc_preserve4(ctx, result, out_port, result_str, arg_list);
   result = boss::eval_expr(ctx, env, datum);
-  bool const is_error = sexp_exceptionp(result);
-  auto text = std::string {};
-  if(is_error) {
+
+  if(sexp_exceptionp(result)) {
     out_port = sexp_open_output_string(ctx);
     sexp_print_exception(ctx, result, out_port);
     result_str = sexp_get_output_string(ctx, out_port);
-    text = sexp_string_data(result_str);
-  } else if(result != SEXP_VOID) {
+    auto text = std::string {sexp_string_data(result_str), sexp_string_size(result_str)};
+    sexp_gc_release4(ctx);
+    return {true, false, std::move(text)};
+  }
+
+  if(sexp_pairp(result) && sexp_car(result) == sexp_intern(ctx, "Binary", -1)) {
+    sexp_gc_var3(convert, args, bossObj);
+    sexp_gc_preserve3(ctx, convert, args, bossObj);
+    convert =
+        sexp_env_ref(ctx, env, sexp_intern(ctx, "convert-to-boss-expression", -1), SEXP_FALSE);
+    args = sexp_list1(ctx, result);
+    bossObj = sexp_apply(ctx, convert, args);
+    auto bytes = std::string {};
+    auto const& complex =
+        std::get<boss::ComplexExpression>(static_cast<boss::Expression::SuperType const&>(
+            static_cast<BOSSExpression*>(sexp_cpointer_value(bossObj))->delegate));
+    for(auto const& spanArgument : complex.getSpanArguments())
+      std::visit(
+          [&bytes](auto const& span) {
+            using ElementType = typename std::decay_t<decltype(span)>::element_type;
+            if constexpr(std::is_pointer_v<decltype(span.begin())> &&
+                         std::is_trivially_copyable_v<ElementType>)
+              bytes.append(reinterpret_cast<char const*>(span.begin()),
+                           span.size() * sizeof(ElementType));
+          },
+          spanArgument);
+    sexp_gc_release3(ctx);
+    sexp_gc_release4(ctx);
+    return {false, true, std::move(bytes)};
+  }
+
+  auto text = std::string {};
+  if(result != SEXP_VOID) {
     if(pretty) {
       sexp const print_proc =
           sexp_env_ref(ctx, env, sexp_intern(ctx, "boss-print", -1), SEXP_FALSE);
@@ -348,10 +390,10 @@ boss::EvalResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = tru
     } else {
       result_str = sexp_write_to_string(ctx, result);
     }
-    text = sexp_string_data(result_str);
+    text = std::string {sexp_string_data(result_str), sexp_string_size(result_str)};
   }
   sexp_gc_release4(ctx);
-  return {is_error, text};
+  return {false, false, std::move(text)};
 }
 
 /**
@@ -531,12 +573,14 @@ auto handleBrowserRequest(std::string_view path) {
   auto result = evaluateDatum(ctx, env, datum);
   sexp_gc_release1(ctx);
 
-  if(result.is_error)
-    return Response {MHD_HTTP_INTERNAL_SERVER_ERROR, ContentType::plain, std::move(result.text)};
-  auto html = tryUnwrapJSONString(result.text);
+  if(result.isError)
+    return Response {MHD_HTTP_INTERNAL_SERVER_ERROR, ContentType::plain, std::move(result.body)};
+  if(result.isBinary)
+    return Response {MHD_HTTP_OK, ContentType::binary, std::move(result.body)};
+  auto html = tryUnwrapJSONString(result.body);
   return html ? Response {MHD_HTTP_OK, ContentType::html, std::move(*html)}
               : Response {MHD_HTTP_INTERNAL_SERVER_ERROR, ContentType::plain,
-                          "Monitoring engine returned a non-string: " + std::move(result.text)};
+                          "Monitoring engine returned a non-string: " + std::move(result.body)};
 }
 
 struct RequestState {
