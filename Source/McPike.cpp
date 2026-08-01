@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <array>
 #include <csignal>
 #include <cstring>
 #include <deque>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <pthread.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -144,10 +146,67 @@ constexpr auto binary = "application/octet-stream";
 
 namespace JSONRPCError {
 constexpr auto parseError = -32700;
+constexpr auto invalidRequest = -32600;
 constexpr auto methodNotFound = -32601;
 constexpr auto invalidParams = -32602;
-constexpr auto internalError = -32603;
 } // namespace JSONRPCError
+
+/// Nothing accumulates a request body but us, and the only legitimate one is a
+/// small JSON-RPC message, so refuse to grow past this rather than let an
+/// unauthenticated sender decide how much memory an idle server holds.
+constexpr auto maximumRequestBodySize = size_t {4} * 1024 * 1024;
+
+/// How long a client may reuse a tools/list answer. The tool set is fixed at build
+/// time; only the engine description embedded in it can move, and not on this scale.
+constexpr auto toolListCacheTimeToLiveMilliseconds = 300000;
+
+/// @brief MCP revisions this server speaks, newest first.
+///
+/// All four are the "legacy" era, in which the client opens with an @c initialize
+/// handshake. The stateless `2026-07-28` era (per-request `_meta`, `server/discover`,
+/// mandatory request headers) is deliberately absent: a modern-only server rejects
+/// legacy clients with no fall-forward path, so it is added once the clients we
+/// serve speak it. See the upgrade notes in CLAUDE.md.
+constexpr std::array<std::string_view, 4> supportedProtocolVersions {"2025-11-25", "2025-06-18",
+                                                                     "2025-03-26", "2024-11-05"};
+
+bool isSupportedProtocolVersion(std::string_view version) {
+  return std::find(supportedProtocolVersions.begin(), supportedProtocolVersions.end(), version) !=
+         supportedProtocolVersions.end();
+}
+
+/// @brief Whether an @c Origin header names a loopback web origin.
+///
+/// Origin validation exists to stop a page on a public website from driving this
+/// server through the user's browser (DNS rebinding). Only an actual browser sends
+/// the header, so a request without one is not the threat this guards against and
+/// is accepted elsewhere; this decides only what to do with a header that is present.
+bool isLoopbackOrigin(std::string_view origin) {
+  auto authority = std::string_view {};
+  for(auto const scheme : {std::string_view {"http://"}, std::string_view {"https://"}})
+    if(origin.size() > scheme.size() && origin.substr(0, scheme.size()) == scheme)
+      authority = origin.substr(scheme.size());
+  if(authority.empty())
+    return false;
+
+  // An IPv6 literal is bracketed, so the port separator is the first colon after
+  // the closing bracket rather than the first colon in the authority.
+  auto const hostEnd = authority.front() == '[' ? authority.find(']') + 1 : authority.find(':');
+  auto const host = authority.substr(0, hostEnd);
+  auto const port = authority.substr(std::min(hostEnd, authority.size()));
+  auto const isDigit = [](char character) { return character >= '0' && character <= '9'; };
+  if(!port.empty() && (port.front() != ':' || !std::all_of(port.begin() + 1, port.end(), isDigit)))
+    return false;
+  return host == "localhost" || host == "127.0.0.1" || host == "[::1]";
+}
+
+/// @brief Serialise a JSON-RPC error response.
+/// @param id the id of the request being answered; null when it could not be read.
+std::string makeJSONRPCError(nlohmann::json const& id, int code, std::string_view message) {
+  return nlohmann::json {
+      {"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}}
+      .dump(-1, ' ', true);
+}
 
 std::optional<std::string> tryUnwrapJSONString(std::string const& jsonString) {
   try {
@@ -167,29 +226,42 @@ std::string handleMCPRequest(std::string const& jsonBody, Evaluator const& evalu
   try {
     request = nlohmann::json::parse(jsonBody);
   } catch(nlohmann::json::parse_error const& parseError) {
-    return nlohmann::json {
-        {"jsonrpc", "2.0"},
-        {"id", nullID},
-        {"error", {{"code", JSONRPCError::parseError}, {"message", parseError.what()}}}}
-        .dump(-1, ' ', true);
+    // The exception text quotes a byte offset and a slice of the body: useful to
+    // whoever runs the server, not something to hand back to whoever sent it.
+    std::cerr << "MCP request parse error: " << parseError.what() << "\n";
+    return makeJSONRPCError(nullID, JSONRPCError::parseError, "Parse error");
   }
+
+  // A batch (top-level array) or a bare scalar is not something this server can
+  // answer. Batching existed only in 2025-03-26 and was removed again in
+  // 2025-06-18; before this check an array fell through the id test below and was
+  // silently accepted with no response at all.
+  if(!request.is_object())
+    return makeJSONRPCError(nullID, JSONRPCError::invalidRequest,
+                            "Request must be a single JSON-RPC object");
 
   auto const& id = request.value("id", nullID);
 
   auto makeResult = [&](nlohmann::json result) {
+    // 2026-07-28 requires resultType on every result. Earlier revisions ignore the
+    // extra member and their clients must read a missing one as "complete", so
+    // emitting it now is correct in both eras.
+    result["resultType"] = "complete";
     return nlohmann::json {{"jsonrpc", "2.0"}, {"id", id}, {"result", std::move(result)}}.dump(
         -1, ' ', true);
   };
   auto makeError = [&](int code, std::string_view message) {
-    return nlohmann::json {
-        {"jsonrpc", "2.0"}, {"id", id}, {"error", {{"code", code}, {"message", message}}}}
-        .dump(-1, ' ', true);
+    return makeJSONRPCError(id, code, message);
   };
 
-  if(!request.contains("id"))
-    return {};
-
   auto const method = request.value("method", "");
+  if(method.empty())
+    return makeError(JSONRPCError::invalidRequest, "Missing method");
+
+  // A notification carries no id — or, from clients that spell it out, a null one.
+  // It gets no response body; the transport answers 202 Accepted.
+  if(id.is_null())
+    return {};
 
   if(method == "ping")
     return makeResult(nlohmann::json::object());
@@ -198,8 +270,17 @@ std::string handleMCPRequest(std::string const& jsonBody, Evaluator const& evalu
     return makeResult(nlohmann::json::object());
 
   if(method == "initialize") {
+    // Echo the client's requested revision when we speak it, otherwise offer the
+    // newest we have and let the client decide. Previously this answered
+    // "2024-11-05" unconditionally, pinning every client to the oldest revision.
+    auto const requested = request.contains("params")
+                               ? request["params"].value("protocolVersion", std::string {})
+                               : std::string {};
+    auto const negotiated = isSupportedProtocolVersion(requested)
+                                ? requested
+                                : std::string {supportedProtocolVersions.front()};
     return makeResult(
-        {{"protocolVersion", "2024-11-05"},
+        {{"protocolVersion", negotiated},
          {"capabilities",
           {{"tools", nlohmann::json::object()}, {"logging", nlohmann::json::object()}}},
          {"serverInfo", {{"name", "boss"}, {"version", "1.0"}}}});
@@ -208,6 +289,7 @@ std::string handleMCPRequest(std::string const& jsonBody, Evaluator const& evalu
   if(method == "tools/list") {
     auto tool = nlohmann::json {};
     tool["name"] = "evaluate";
+    tool["title"] = "BOSS expression evaluator";
     auto const engineDescriptionResult = evaluator("(GetEngineDescription)");
     auto const engineDescription = engineDescriptionResult.is_error
                                        ? std::string {}
@@ -225,7 +307,17 @@ Note that this list is likely long and will be truncated at 2Kb length. To Get t
     tool["inputSchema"]["properties"]["expression"]["description"] =
         R"(A BOSS s-expression. String literals accept raw UTF-8 or JSON \uXXXX escapes interchangeably. Be mindful that filenames may contain invisible characters (e.g. NBSP in Apple Watch exports) that cannot be reproduced by re-typing — see the tool description for handling.)";
     tool["inputSchema"]["required"] = nlohmann::json::array({"expression"});
-    return makeResult({{"tools", nlohmann::json::array({tool})}});
+    // An expression can write as readily as it can read, and the engines it reaches
+    // are open-ended, so neither hint may claim otherwise.
+    tool["annotations"]["readOnlyHint"] = false;
+    tool["annotations"]["openWorldHint"] = true;
+    // Building this list costs a live (GetEngineDescription) evaluation, so tell
+    // the client how long it may reuse the answer instead of asking again. Scoped
+    // private: the description reflects this server's engines, not a shared truth
+    // an intermediary should hand to anyone else.
+    return makeResult({{"tools", nlohmann::json::array({tool})},
+                       {"ttlMs", toolListCacheTimeToLiveMilliseconds},
+                       {"cacheScope", "private"}});
   }
 
   if(method == "tools/call") {
@@ -248,9 +340,13 @@ Note that this list is likely long and will be truncated at 2Kb length. To Get t
         {{"jsonrpc", "2.0"},
          {"method", "notifications/message"},
          {"params", {{"level", "debug"}, {"data", " -> " + evaluationResult.text}}}});
-    if(evaluationResult.is_error)
-      return makeError(JSONRPCError::internalError, evaluationResult.text);
-    return makeResult({{"content", {{{"type", "text"}, {"text", evaluationResult.text}}}}});
+    // A BOSS failure is feedback the model can act on — a mistyped operator, a
+    // missing file — so it belongs in the result where the model will see it.
+    // Returned as a JSON-RPC error (as it was until now) it reads to the client as
+    // the server malfunctioning, and the text tends never to reach the model at all.
+    // The protocol errors above stay errors: those are faults in the call itself.
+    return makeResult({{"content", {{{"type", "text"}, {"text", evaluationResult.text}}}},
+                       {"isError", evaluationResult.is_error}});
   }
 
   return makeError(JSONRPCError::methodNotFound, "Method not found: " + method);
@@ -585,6 +681,7 @@ auto handleBrowserRequest(std::string_view path) {
 
 struct RequestState {
   std::string body;
+  bool bodyTooLarge = false;
 };
 
 MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const char* url,
@@ -600,7 +697,12 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
   auto* state = static_cast<RequestState*>(*connectionContext);
 
   if(*uploadDataSize > 0) {
-    state->body.append(uploadData, *uploadDataSize);
+    // Keep consuming the upload once it is too big — MHD wants the body drained
+    // before we can answer — but stop storing it.
+    if(state->body.size() + *uploadDataSize > maximumRequestBodySize)
+      state->bodyTooLarge = true;
+    else
+      state->body.append(uploadData, *uploadDataSize);
     *uploadDataSize = 0;
     return MHD_YES;
   }
@@ -608,18 +710,53 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
   auto responseBody = std::string {};
   auto statusCode = MHD_HTTP_OK;
   auto contentType = ContentType::plain;
+  char const* allowedMethods = nullptr;
 
   auto const urlView = std::string_view {url};
   auto const path = urlView.substr(0, urlView.find('?'));
   auto const methodView = std::string_view {method};
+  auto const* const origin = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Origin");
+  auto const* const protocolVersion =
+      MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "MCP-Protocol-Version");
+  // Rejections at this layer are answered before any request id could be read, so
+  // the JSON-RPC error they carry has none.
+  auto const noID = nlohmann::json(nullptr);
 
-  if(methodView == "POST" && path == "/mcp") {
-    auto mcpResponse = handleMCPRequest(state->body, *evaluator);
-    if(mcpResponse.empty()) {
-      statusCode = MHD_HTTP_NO_CONTENT;
-    } else {
-      responseBody = std::move(mcpResponse);
+  if(origin != nullptr && !isLoopbackOrigin(origin)) {
+    statusCode = MHD_HTTP_FORBIDDEN;
+    contentType = ContentType::json;
+    responseBody = makeJSONRPCError(noID, JSONRPCError::invalidRequest, "Origin not permitted");
+  } else if(path == "/mcp") {
+    if(methodView != "POST") {
+      // GET and DELETE are how the earlier Streamable HTTP revisions opened a
+      // standalone stream and ended a session. We offer neither, and 405 is the
+      // answer those revisions and 2026-07-28 both ask for. Until now such a
+      // request fell through to the browser handler below, which tried to evaluate
+      // the symbol `mcp` in BOSS and answered 500 — and a client probing which era
+      // this server speaks reads that as neither.
+      statusCode = MHD_HTTP_METHOD_NOT_ALLOWED;
+      allowedMethods = "POST";
+      responseBody = "Method Not Allowed";
+    } else if(state->bodyTooLarge) {
+      statusCode = MHD_HTTP_CONTENT_TOO_LARGE;
+      responseBody = "Request body too large";
+    } else if(protocolVersion != nullptr && !isSupportedProtocolVersion(protocolVersion)) {
+      // Clients have sent this header since 2025-06-18. Its absence is not an
+      // error: it means an older client, or one still in the handshake.
+      statusCode = MHD_HTTP_BAD_REQUEST;
       contentType = ContentType::json;
+      responseBody =
+          makeJSONRPCError(noID, JSONRPCError::invalidRequest,
+                           std::string {"Unsupported MCP-Protocol-Version: "} + protocolVersion);
+    } else {
+      auto mcpResponse = handleMCPRequest(state->body, *evaluator);
+      if(mcpResponse.empty()) {
+        // A notification: accepted, with nothing to send back.
+        statusCode = MHD_HTTP_ACCEPTED;
+      } else {
+        responseBody = std::move(mcpResponse);
+        contentType = ContentType::json;
+      }
     }
   } else if(methodView == "GET" && path == "/sse") {
     auto* sseResponse = sseBroadcaster.openStream(connection);
@@ -644,6 +781,8 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
     return MHD_NO;
 
   MHD_add_response_header(response, "Content-Type", contentType);
+  if(allowedMethods != nullptr)
+    MHD_add_response_header(response, "Allow", allowedMethods);
   auto const queueResult = MHD_queue_response(connection, statusCode, response);
   MHD_destroy_response(response);
   return queueResult;

@@ -25,8 +25,8 @@ Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies ar
 ## Architecture
 
 - **`Source/McPike.cpp`** --- the entire server. Key layers top to bottom:
-  - `handle_mcp_request()` --- parses JSON-RPC 2.0 and dispatches `initialize`, `tools/list`, and `tools/call` (the only real tool: `evaluate`). Returns empty string for notification methods (-> 204 No Content).
-  - `handle_http_request()` / `request_completed()` --- libmicrohttpd callbacks. Accumulates POST body in `RequestState`, then calls `handle_mcp_request`. Only `/` and `/mcp` paths accept POST; everything else is 404.
+  - `handleMCPRequest()` --- parses JSON-RPC 2.0 and dispatches `initialize`, `ping`, `logging/setLevel`, `tools/list`, and `tools/call` (the only real tool: `evaluate`). Returns empty string for notifications (-> 202 Accepted). A failed BOSS evaluation comes back as a normal result with `isError: true`, not as a JSON-RPC error --- the model can act on the message, and a protocol error would hide it.
+  - `handleHTTPRequest()` / `requestCompleted()` --- libmicrohttpd callbacks. Accumulates the POST body in `RequestState` (capped at 4 MB -> 413), validates a present `Origin` against loopback (-> 403) and a present `MCP-Protocol-Version` against the supported set (-> 400), then calls `handleMCPRequest`. `POST /mcp` is the MCP endpoint; any other method on it is 405. `GET /sse` opens the legacy HTTP+SSE log stream; every other `GET` is handled by the browser layer, which evaluates the URL path as an S-expression.
   - `run_server()` --- starts `MHD_Daemon` in select-mode. On macOS, tries `launch_activate_socket` first (launchd on-demand activation on port 5080); falls back to binding `127.0.0.1:5080` directly. Runs the `select` loop until SIGTERM/SIGINT.
   - `main()` --- initialises a BOSS context via `boss::initialize_boss_context()`, then calls `run_server` with a lambda that calls `boss::evaluate_expression`.
 
@@ -36,8 +36,24 @@ Like BOSS, the `libmicrohttpd` 0.9.77 and `nlohmann/json` 3.11.3 dependencies ar
 
 ## MCP endpoint
 
-`POST http://localhost:5080/mcp` (or `/`)
-Protocol version: `2024-11-05`
+`POST http://localhost:5080/mcp` --- the single MCP endpoint (`/` is the browser layer, not MCP).
+Protocol versions: `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05` --- `initialize` echoes the client's requested version when it is one of these, otherwise answers with the newest.
 Single tool: `evaluate` with one required string argument `expression`.
 
 The on-demand launchd instance is discoverable via Bonjour/mDNS as `_mcp._tcp.local` (port 5080, loopback-only). Note that Claude has no native mDNS discovery, so register it with a fixed URL: `claude mcp add --transport http mcpike http://localhost:5080/mcp`.
+
+### Upgrading to the 2026-07-28 revision
+
+The [`2026-07-28` revision](https://modelcontextprotocol.io/specification/2026-07-28/changelog) splits MCP into two eras: *legacy* versions open with an `initialize` handshake, while *modern* ones are stateless and carry version, identity and capabilities in each request's `_meta`. McPike currently implements the legacy era only, because a modern-only server rejects legacy clients and they have no fall-forward path — and the clients we serve have not switched yet.
+
+Everything already in place is era-neutral: `resultType` on every result, `isError` for tool failures, `ttlMs`/`cacheScope` on `tools/list`, `202` for notifications, `405` for `GET`/`DELETE` on `/mcp`, `Origin` validation, and `MCP-Protocol-Version` parsing. What remains, to be added as a second branch in `handleMCPRequest` (dispatch on the presence of `params._meta["io.modelcontextprotocol/protocolVersion"]`, which the spec explicitly allows a dual-era server to serve on the same endpoint):
+
+- `server/discover` — mandatory in the modern era; returns `supportedVersions`, `capabilities`, `instructions`, and `serverInfo` under the result's `_meta`.
+- Validation of the required `Mcp-Method` and `Mcp-Name` headers against the request body, rejecting a mismatch with `-32020`.
+- The MCP-reserved error codes `-32020` (HeaderMismatch), `-32021` (MissingRequiredClientCapability) and `-32022` (UnsupportedProtocolVersion, whose `data` carries `{supported, requested}`).
+- HTTP `404` alongside `-32601` for an unknown method — that pairing is how a client tells a modern server from a legacy one.
+- Dropping `ping` and `logging/setLevel` on that branch (both removed from the protocol), and emitting `notifications/message` only for requests that asked for it via `_meta["io.modelcontextprotocol/logLevel"]` — the current unconditional broadcast in `tools/call` would violate that rule.
+
+Not applicable to this server, recorded so it need not be re-derived: MRTR / `input_required` (nothing here needs input back from the client), `subscriptions/listen` (nothing to push but the log channel), the Tasks and Apps extensions, pagination cursors (one tool), and the authorization changes (loopback only).
+
+Note also that HTTP+SSE — the transport behind `GET /sse` — is now formally Deprecated under the new twelve-month feature-lifecycle policy, along with Roots, Sampling and Logging. Still functional, but removable in a later revision, so `/sse` wants revisiting before that window closes.
