@@ -1,0 +1,3 @@
+# Local build tree: `cmake -B build` puts CMake state here, alongside the fetched
+# BOSS checkout and the libmicrohttpd / nlohmann-json sources and artefacts.
+build/
