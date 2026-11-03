@@ -587,6 +587,14 @@ struct RequestState {
   std::string body;
 };
 
+// RFC 8615 reserves /.well-known/ for metadata about the HTTP server itself, so
+// these paths are never BOSS queries. McPike publishes no such metadata and
+// answers 404, which MCP clients' OAuth discovery probes expect.
+bool isWellKnownPath(std::string_view path) {
+  constexpr auto prefix = std::string_view {"/.well-known/"};
+  return path.substr(0, prefix.size()) == prefix;
+}
+
 MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const char* url,
                              const char* method, const char* /*version*/, const char* uploadData,
                              size_t* uploadDataSize, void** connectionContext) {
@@ -628,7 +636,7 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
     auto const sseQueueResult = MHD_queue_response(connection, MHD_HTTP_OK, sseResponse);
     MHD_destroy_response(sseResponse);
     return sseQueueResult;
-  } else if(methodView == "GET") {
+  } else if(methodView == "GET" && !isWellKnownPath(path)) {
     auto browserResponse = handleBrowserRequest(path);
     statusCode = browserResponse.status;
     contentType = browserResponse.contentType;
