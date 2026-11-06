@@ -2,19 +2,27 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <csignal>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <microhttpd.h>
+#include <microhttpd_ws.h>
 #include <mutex>
 #include <netinet/in.h>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <pthread.h>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifdef __APPLE__
@@ -328,16 +336,27 @@ struct DatumResult {
   bool isError;
   bool isBinary;
   std::string body;
+  std::optional<std::string> contentType;
 };
+
+// Splits a wrapped result (<head> <argument> <body>) into <argument> and <body>, so that
+// McPike can act on <argument> and send only <body> to the client.
+std::optional<std::pair<sexp, sexp>> matchWrapper(sexp ctx, sexp datum, char const* head) {
+  if(sexp_pairp(datum) && sexp_car(datum) == sexp_intern(ctx, head, -1) &&
+     sexp_pairp(sexp_cdr(datum)) && sexp_pairp(sexp_cddr(datum)))
+    return std::pair {sexp_cadr(datum), sexp_caddr(datum)};
+  return {};
+}
 
 /**
  * @brief Evaluate a pre-built datum and produce the browser response body.
  *
- * A (Binary :spans <bytevector>...) result is returned as its span bytevectors
- * concatenated verbatim (raw binary); anything else is serialised to text via
- * boss-print. The text/error tail mirrors boss::evaluate_expression (keep them in
- * sync); boss::eval_expr wraps the datum in (boss-eval ...), exactly as the string
- * path does after sexp_read.
+ * A (ContentType "<media type>" <result>) wrapper sets the response's
+ * Content-Type and is otherwise transparent. A (Binary :spans <bytevector>...) result is returned
+ * as its span bytevectors concatenated verbatim (raw binary); anything else is serialised to text
+ * via boss-print. The text/error tail mirrors boss::evaluate_expression (keep them in sync);
+ * boss::eval_expr wraps the datum in (boss-eval ...), exactly as the string path does after
+ * sexp_read.
  */
 DatumResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
   boss::concurrency::ConcurrencyTripwire const tripwire(ctx, "evaluateDatum");
@@ -352,6 +371,13 @@ DatumResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
     auto text = std::string {sexp_string_data(result_str), sexp_string_size(result_str)};
     sexp_gc_release4(ctx);
     return {true, false, std::move(text)};
+  }
+
+  auto contentType = std::optional<std::string> {};
+  if(auto const wrapper = matchWrapper(ctx, result, "ContentType");
+     wrapper && sexp_stringp(wrapper->first)) {
+    contentType = std::string {sexp_string_data(wrapper->first), sexp_string_size(wrapper->first)};
+    result = wrapper->second;
   }
 
   if(sexp_pairp(result) && sexp_car(result) == sexp_intern(ctx, "Binary", -1)) {
@@ -377,7 +403,7 @@ DatumResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
           spanArgument);
     sexp_gc_release3(ctx);
     sexp_gc_release4(ctx);
-    return {false, true, std::move(bytes)};
+    return {false, true, std::move(bytes), std::move(contentType)};
   }
 
   auto text = std::string {};
@@ -393,7 +419,7 @@ DatumResult evaluateDatum(sexp ctx, sexp env, sexp datum, bool pretty = true) {
     text = std::string {sexp_string_data(result_str), sexp_string_size(result_str)};
   }
   sexp_gc_release4(ctx);
-  return {false, false, std::move(text)};
+  return {false, false, std::move(text), std::move(contentType)};
 }
 
 /**
@@ -555,7 +581,7 @@ auto handleBrowserRequest(std::string_view path) {
 
   struct Response {
     unsigned int status;
-    char const* contentType;
+    std::string contentType;
     std::string body;
   };
   auto& worker = currentWorker();
@@ -576,27 +602,381 @@ auto handleBrowserRequest(std::string_view path) {
   if(result.isError)
     return Response {MHD_HTTP_INTERNAL_SERVER_ERROR, ContentType::plain, std::move(result.body)};
   if(result.isBinary)
-    return Response {MHD_HTTP_OK, ContentType::binary, std::move(result.body)};
+    return Response {MHD_HTTP_OK, result.contentType.value_or(ContentType::binary),
+                     std::move(result.body)};
   auto html = tryUnwrapJSONString(result.body);
-  return html ? Response {MHD_HTTP_OK, ContentType::html, std::move(*html)}
+  return html ? Response {MHD_HTTP_OK, result.contentType.value_or(ContentType::html),
+                          std::move(*html)}
               : Response {MHD_HTTP_INTERNAL_SERVER_ERROR, ContentType::plain,
                           "Monitoring engine returned a non-string: " + std::move(result.body)};
+}
+
+// --- WebSocket query channel -------------------------------------------------
+// A persistent channel per connection: each inbound text frame is one BOSS query.
+// A thread dedicated to the connection evaluates the queries, so one thread_local
+// BOSS context (via the Evaluator) serves the whole connection, and answers each
+// with one text frame, in receipt order. libmicrohttpd's MHD_websocket_* functions
+// encode and decode the RFC 6455 frames.
+
+bool sendAll(MHD_socket fd, char const* data, size_t length) {
+  for(auto sent = size_t {0}; sent < length;) {
+    auto const written = send(fd, data + sent, length - sent, 0);
+    if(written <= 0)
+      return false;
+    sent += static_cast<size_t>(written);
+  }
+  return true;
+}
+
+bool sendTextFrame(MHD_WebSocketStream* ws, MHD_socket fd, std::string const& text) {
+  char* frame = nullptr;
+  auto frameLength = size_t {0};
+  if(MHD_websocket_encode_text(ws, text.data(), text.size(), MHD_WEBSOCKET_FRAGMENTATION_NONE,
+                               &frame, &frameLength, nullptr) != MHD_WEBSOCKET_STATUS_OK)
+    return false;
+  auto const sent = sendAll(fd, frame, frameLength);
+  MHD_websocket_free(ws, frame);
+  return sent;
+}
+
+enum class CloseReason : unsigned short {
+  regular = MHD_WEBSOCKET_CLOSEREASON_REGULAR,
+  goingAway = MHD_WEBSOCKET_CLOSEREASON_GOING_AWAY,
+  // RFC 6455 leaves 4000-4999 to applications.
+  replacedByNewerSession = 4000
+};
+
+void sendCloseFrame(MHD_WebSocketStream* ws, MHD_socket fd, CloseReason reason) {
+  auto const code = static_cast<unsigned short>(reason);
+  char* frame = nullptr;
+  auto frameLength = size_t {0};
+  if(MHD_websocket_encode_close(ws, code, nullptr, 0, &frame, &frameLength) ==
+     MHD_WEBSOCKET_STATUS_OK) {
+    sendAll(fd, frame, frameLength);
+    MHD_websocket_free(ws, frame);
+  }
+}
+
+struct WebSocketConnection {
+  MHD_socket fd;
+  MHD_UpgradeResponseHandle* upgrade;
+  Evaluator const* evaluator;
+  std::string received;
+  // The connection thread and the shutdown notification both write frames to fd.
+  // Holding sendMutex for every write keeps their frames from interleaving, and
+  // keeps any write from reaching fd after MHD_upgrade_action has closed it.
+  std::mutex sendMutex;
+  // Written only while sendMutex is held.
+  std::atomic<bool> closing {false};
+};
+
+// The caller must hold connection.sendMutex.
+void closeConnectionLocked(WebSocketConnection& connection) {
+  if(!connection.closing.exchange(true))
+    MHD_upgrade_action(connection.upgrade, MHD_UPGRADE_ACTION_CLOSE);
+}
+
+void closeConnection(WebSocketConnection& connection) {
+  auto const lock = std::scoped_lock {connection.sendMutex};
+  closeConnectionLocked(connection);
+}
+
+// Encodes payloads into WebSocket frames and decodes received frames into payloads, as
+// RFC 6455 section 5 defines them: https://www.rfc-editor.org/rfc/rfc6455#section-5
+using WebSocketFrameEncoderDecoder =
+    std::unique_ptr<MHD_WebSocketStream, decltype(&MHD_websocket_stream_free)>;
+
+WebSocketFrameEncoderDecoder openWebSocketFrameEncoderDecoder() {
+  MHD_WebSocketStream* ws = nullptr;
+  if(MHD_websocket_stream_init(&ws, MHD_WEBSOCKET_FLAG_SERVER | MHD_WEBSOCKET_FLAG_NO_FRAGMENTS,
+                               0) != MHD_WEBSOCKET_STATUS_OK)
+    ws = nullptr;
+  return {ws, &MHD_websocket_stream_free};
+}
+
+// For a thread other than the connection's own, which holds the connection's stream: server
+// frames are unmasked and unfragmented, so a short-lived stream encodes them.
+void closeFromOutside(WebSocketConnection& connection, std::optional<std::string> notice,
+                      CloseReason reason) {
+  auto const lock = std::scoped_lock {connection.sendMutex};
+  if(connection.closing)
+    return;
+  if(auto const ws = openWebSocketFrameEncoderDecoder())
+    if(!notice || sendTextFrame(ws.get(), connection.fd, *notice))
+      sendCloseFrame(ws.get(), connection.fd, reason);
+  shutdown(connection.fd, SHUT_RDWR);
+  closeConnectionLocked(connection);
+}
+
+using SessionID = std::int64_t;
+
+// Live connections, so that shutdown can notify and close them.
+struct WebSocketRegistry {
+  std::mutex mutex;
+  std::vector<std::shared_ptr<WebSocketConnection>> connections;
+
+  void add(std::shared_ptr<WebSocketConnection> connection) {
+    auto const lock = std::scoped_lock {mutex};
+    connections.push_back(std::move(connection));
+  }
+
+  void remove(WebSocketConnection const* connection) {
+    auto const lock = std::scoped_lock {mutex};
+    connections.erase(std::remove_if(connections.begin(), connections.end(),
+                                     [&](auto const& c) { return c.get() == connection; }),
+                      connections.end());
+  }
+
+  struct Session {
+    std::shared_ptr<WebSocketConnection> connection;
+    SessionID id;
+  };
+  std::optional<Session> session;
+
+  // Returns the session that the new one replaces.
+  std::optional<Session> startSession(WebSocketConnection const* connection, SessionID id) {
+    auto const lock = std::scoped_lock {mutex};
+    auto const found = std::find_if(connections.begin(), connections.end(),
+                                    [&](auto const& c) { return c.get() == connection; });
+    if(found == connections.end())
+      return {};
+    return std::exchange(session, Session {*found, id});
+  }
+
+  std::optional<SessionID> endSession(WebSocketConnection const* connection) {
+    auto const lock = std::scoped_lock {mutex};
+    if(!session || session->connection.get() != connection)
+      return {};
+    return std::exchange(session, std::nullopt)->id;
+  }
+
+  // Called once at shutdown. A thread blocked mid-evaluation cannot be interrupted;
+  // once closing is set, that thread skips its reply if the evaluation ever returns.
+  void shutdownAll() {
+    auto snapshot = std::vector<std::shared_ptr<WebSocketConnection>> {};
+    {
+      auto const lock = std::scoped_lock {mutex};
+      snapshot = connections;
+    }
+    for(auto const& connection : snapshot)
+      closeFromOutside(*connection, "(ServerShuttingDown)", CloseReason::goingAway);
+  }
+};
+
+WebSocketRegistry webSocketRegistry;
+
+void makeSocketBlocking(MHD_socket fd) {
+  auto const flags = fcntl(fd, F_GETFL);
+  if(flags != -1)
+    fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+// Escape non-ASCII characters as JSON \uXXXX literals (reusing nlohmann, which
+// decodes the UTF-8 and emits surrogate pairs); ASCII bytes pass through verbatim.
+// Keeps invisible characters (e.g. NBSP) visible and every text frame pure-ASCII.
+std::string escapeNonAscii(std::string const& text) {
+  if(std::all_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x80; }))
+    return text;
+
+  auto escaped = std::string {};
+  for(auto i = size_t {0}; i < text.size();) {
+    if(static_cast<unsigned char>(text[i]) < 0x80) {
+      escaped += text[i++];
+      continue;
+    }
+    auto run = i;
+    while(run < text.size() && static_cast<unsigned char>(text[run]) >= 0x80)
+      ++run;
+    auto const dumped = nlohmann::json(text.substr(i, run - i))
+                            .dump(-1, ' ', true, nlohmann::json::error_handler_t::replace);
+    escaped.append(dumped, 1, dumped.size() - 2); // strip the surrounding quotes
+    i = run;
+  }
+  return escaped;
+}
+
+struct SessionReply {
+  SessionID id;
+  std::string reply;
+};
+
+// Returns <id> and the printed <reply> when the printed result of an evaluation is
+// (Session <id> <reply>), so that McPike can record the session and send the client only
+// <reply>. The WebSocket path receives each result as printed text, so this function reads
+// that text back into a datum to find the id (see little-big-h/McPike#6).
+std::optional<SessionReply> readSessionReply(std::string const& text) {
+  auto const ctx = currentWorker().context();
+  if(ctx == nullptr || text.rfind("(Session ", 0) != 0)
+    return {};
+  sexp_gc_var3(port, datum, printed);
+  sexp_gc_preserve3(ctx, port, datum, printed);
+  port = sexp_open_input_string(
+      ctx, sexp_c_string(ctx, text.c_str(), static_cast<sexp_sint_t>(text.size())));
+  datum = sexp_read(ctx, port);
+  auto result = std::optional<SessionReply> {};
+  if(auto const wrapper = matchWrapper(ctx, datum, "Session");
+     wrapper && sexp_fixnump(wrapper->first)) {
+    printed = sexp_write_to_string(ctx, wrapper->second);
+    result = SessionReply {sexp_unbox_fixnum(wrapper->first),
+                           std::string {sexp_string_data(printed), sexp_string_size(printed)}};
+  }
+  sexp_gc_release3(ctx);
+  return result;
+}
+
+void signalConnectionClosed(Evaluator const& evaluate, SessionID session) {
+  evaluate("(ConnectionClosed " + std::to_string(session) + ")");
+}
+
+// McPike keeps one session connection: a newer session closes the older one's connection
+// and reports the older session as closed.
+void startSession(WebSocketConnection const& connection, SessionID id, Evaluator const& evaluate) {
+  auto const replaced = webSocketRegistry.startSession(&connection, id);
+  if(!replaced)
+    return;
+  if(replaced->connection.get() != &connection)
+    closeFromOutside(*replaced->connection, std::nullopt, CloseReason::replacedByNewerSession);
+  signalConnectionClosed(evaluate, replaced->id);
+}
+
+// Read -> decode -> evaluate -> reply until the peer closes, a send fails, or a
+// shutdown fires. Queries are answered strictly in the order they arrived.
+void runConnection(MHD_WebSocketStream* ws, WebSocketConnection& connection) {
+  auto const& evaluate = *connection.evaluator;
+  auto buffer = std::move(connection.received);
+  auto chunk = std::string(4096, '\0');
+
+  while(!connection.closing) {
+    // Drain every complete frame already buffered before reading more.
+    auto offset = size_t {0};
+    while(offset < buffer.size()) {
+      char* payload = nullptr;
+      auto payloadLength = size_t {0};
+      auto consumed = size_t {0};
+      auto const status = MHD_websocket_decode(ws, buffer.data() + offset, buffer.size() - offset,
+                                               &consumed, &payload, &payloadLength);
+      offset += consumed;
+      if(status == MHD_WEBSOCKET_STATUS_OK)
+        break; // frame incomplete; read more
+      if(status == MHD_WEBSOCKET_STATUS_TEXT_FRAME) {
+        auto const result = evaluate(std::string {payload, payloadLength});
+        MHD_websocket_free(ws, payload);
+        auto text = result.is_error ? ";; error:\n" + result.text : result.text;
+        if(auto const sessionReply = result.is_error ? std::nullopt : readSessionReply(text)) {
+          startSession(connection, sessionReply->id, evaluate);
+          text = sessionReply->reply;
+        }
+        auto const reply = escapeNonAscii(text);
+        // A shutdown may have closed the socket while evaluate() was blocked;
+        // writing then would reach a closed (possibly recycled) fd.
+        auto const lock = std::scoped_lock {connection.sendMutex};
+        if(connection.closing || !sendTextFrame(ws, connection.fd, reply))
+          return;
+      } else if(status == MHD_WEBSOCKET_STATUS_PING_FRAME) {
+        char* pong = nullptr;
+        auto pongLength = size_t {0};
+        auto const lock = std::scoped_lock {connection.sendMutex};
+        auto const ponged = !connection.closing &&
+                            MHD_websocket_encode_pong(ws, payload, payloadLength, &pong,
+                                                      &pongLength) == MHD_WEBSOCKET_STATUS_OK &&
+                            sendAll(connection.fd, pong, pongLength);
+        MHD_websocket_free(ws, pong);
+        MHD_websocket_free(ws, payload);
+        if(!ponged)
+          return;
+      } else {
+        MHD_websocket_free(ws, payload); // close frame or protocol error
+        return;
+      }
+    }
+    buffer.erase(0, offset);
+
+    auto const received = recv(connection.fd, chunk.data(), chunk.size(), 0);
+    if(received <= 0)
+      return;
+    buffer.append(chunk.data(), static_cast<size_t>(received));
+  }
+}
+
+void connectionLoop(std::shared_ptr<WebSocketConnection> connection) {
+  makeSocketBlocking(connection->fd);
+
+  if(auto const ws = openWebSocketFrameEncoderDecoder()) {
+    runConnection(ws.get(), *connection);
+    auto const lock = std::scoped_lock {connection->sendMutex};
+    if(!connection->closing)
+      sendCloseFrame(ws.get(), connection->fd, CloseReason::regular);
+  }
+  closeConnection(*connection);
+  if(auto const session = webSocketRegistry.endSession(connection.get()))
+    signalConnectionClosed(*connection->evaluator, *session);
+  webSocketRegistry.remove(connection.get());
+}
+
+void upgradeHandler(void* cls, MHD_Connection* /*connection*/, void* /*requestContext*/,
+                    char const* extraIn, size_t extraInSize, MHD_socket fd,
+                    MHD_UpgradeResponseHandle* upgrade) {
+  auto connection = std::make_shared<WebSocketConnection>();
+  connection->fd = fd;
+  connection->upgrade = upgrade;
+  connection->evaluator = static_cast<Evaluator const*>(cls);
+  connection->received = extraIn != nullptr ? std::string {extraIn, extraInSize} : std::string {};
+  webSocketRegistry.add(connection);
+  std::thread(connectionLoop, connection).detach();
+}
+
+MHD_Result handleWebSocketHandshake(MHD_Connection* connection, Evaluator const* evaluator,
+                                    char const* httpVersion) {
+  auto const header = [&](char const* name) {
+    return MHD_lookup_connection_value(connection, MHD_HEADER_KIND, name);
+  };
+  auto const* key = header(MHD_HTTP_HEADER_SEC_WEBSOCKET_KEY);
+  auto const* connectionHeader = header(MHD_HTTP_HEADER_CONNECTION);
+  auto const* upgradeHeader = header(MHD_HTTP_HEADER_UPGRADE);
+  auto const* versionHeader = header(MHD_HTTP_HEADER_SEC_WEBSOCKET_VERSION);
+  auto const valid =
+      key != nullptr && connectionHeader != nullptr && upgradeHeader != nullptr &&
+      versionHeader != nullptr &&
+      MHD_websocket_check_http_version(httpVersion) == MHD_WEBSOCKET_STATUS_OK &&
+      MHD_websocket_check_connection_header(connectionHeader) == MHD_WEBSOCKET_STATUS_OK &&
+      MHD_websocket_check_upgrade_header(upgradeHeader) == MHD_WEBSOCKET_STATUS_OK &&
+      MHD_websocket_check_version_header(versionHeader) == MHD_WEBSOCKET_STATUS_OK;
+
+  if(!valid) {
+    static char const message[] = "Invalid WebSocket handshake";
+    auto* response = MHD_create_response_from_buffer(
+        sizeof(message) - 1, const_cast<char*>(message), MHD_RESPMEM_PERSISTENT);
+    auto const queued = MHD_queue_response(connection, MHD_HTTP_BAD_REQUEST, response);
+    MHD_destroy_response(response);
+    return queued;
+  }
+
+  char accept[29];
+  MHD_websocket_create_accept_header(key, accept);
+  auto* response =
+      MHD_create_response_for_upgrade(&upgradeHandler, const_cast<Evaluator*>(evaluator));
+  MHD_add_response_header(response, MHD_HTTP_HEADER_UPGRADE, "websocket");
+  MHD_add_response_header(response, MHD_HTTP_HEADER_SEC_WEBSOCKET_ACCEPT, accept);
+  auto const queued = MHD_queue_response(connection, MHD_HTTP_SWITCHING_PROTOCOLS, response);
+  MHD_destroy_response(response);
+  return queued;
 }
 
 struct RequestState {
   std::string body;
 };
 
-// RFC 8615 reserves /.well-known/ for metadata about the HTTP server itself, so
-// these paths are never BOSS queries. McPike publishes no such metadata and
-// answers 404, which MCP clients' OAuth discovery probes expect.
-bool isWellKnownPath(std::string_view path) {
-  constexpr auto prefix = std::string_view {"/.well-known/"};
-  return path.substr(0, prefix.size()) == prefix;
+// Clients request these paths on their own initiative, so they are never BOSS
+// queries; McPike answers 404 without evaluating them. RFC 8615 reserves
+// /.well-known/ for metadata about the HTTP server itself, which MCP clients'
+// OAuth discovery probes request, and browsers request /favicon.ico for every page.
+bool isServerMetadataPath(std::string_view path) {
+  constexpr auto wellKnownPrefix = std::string_view {"/.well-known/"};
+  return path.substr(0, wellKnownPrefix.size()) == wellKnownPrefix || path == "/favicon.ico";
 }
 
 MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const char* url,
-                             const char* method, const char* /*version*/, const char* uploadData,
+                             const char* method, const char* version, const char* uploadData,
                              size_t* uploadDataSize, void** connectionContext) {
   auto* evaluator = static_cast<Evaluator*>(userData);
 
@@ -615,7 +995,7 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
 
   auto responseBody = std::string {};
   auto statusCode = MHD_HTTP_OK;
-  auto contentType = ContentType::plain;
+  auto contentType = std::string {ContentType::plain};
 
   auto const urlView = std::string_view {url};
   auto const path = urlView.substr(0, urlView.find('?'));
@@ -629,6 +1009,8 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
       responseBody = std::move(mcpResponse);
       contentType = ContentType::json;
     }
+  } else if(methodView == "GET" && path == "/ws") {
+    return handleWebSocketHandshake(connection, evaluator, version);
   } else if(methodView == "GET" && path == "/sse") {
     auto* sseResponse = sseBroadcaster.openStream(connection);
     if(sseResponse == nullptr)
@@ -636,10 +1018,10 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
     auto const sseQueueResult = MHD_queue_response(connection, MHD_HTTP_OK, sseResponse);
     MHD_destroy_response(sseResponse);
     return sseQueueResult;
-  } else if(methodView == "GET" && !isWellKnownPath(path)) {
+  } else if(methodView == "GET" && !isServerMetadataPath(path)) {
     auto browserResponse = handleBrowserRequest(path);
     statusCode = browserResponse.status;
-    contentType = browserResponse.contentType;
+    contentType = std::move(browserResponse.contentType);
     responseBody = std::move(browserResponse.body);
   } else {
     statusCode = MHD_HTTP_NOT_FOUND;
@@ -651,7 +1033,7 @@ MHD_Result handleHTTPRequest(void* userData, MHD_Connection* connection, const c
   if(!response)
     return MHD_NO;
 
-  MHD_add_response_header(response, "Content-Type", contentType);
+  MHD_add_response_header(response, "Content-Type", contentType.c_str());
   auto const queueResult = MHD_queue_response(connection, statusCode, response);
   MHD_destroy_response(response);
   return queueResult;
@@ -670,7 +1052,8 @@ void runServer(Evaluator const& evaluator, int port) {
   sigaddset(&stopSignals, SIGINT);
   pthread_sigmask(SIG_BLOCK, &stopSignals, nullptr);
 
-  auto const daemonFlags = MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_SUSPEND_RESUME | MHD_USE_ITC;
+  auto const daemonFlags =
+      MHD_USE_INTERNAL_POLLING_THREAD | MHD_USE_SUSPEND_RESUME | MHD_USE_ITC | MHD_ALLOW_UPGRADE;
   auto const poolSize = std::max(1u, std::thread::hardware_concurrency());
 
   MHD_Daemon* daemon = nullptr;
@@ -733,12 +1116,16 @@ void runServer(Evaluator const& evaluator, int port) {
     break;
   }
 
-  MHD_stop_daemon(daemon);
+  webSocketRegistry.shutdownAll();
+  // MHD_stop_daemon would wait for every worker, and a worker evaluating a query that
+  // MonitoringEngine holds for approval never returns. Those evaluations have nothing
+  // to save, so exit at once; the kernel still delivers the frames already sent.
+  std::_Exit(0);
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
   // Run chibi's one-time global init on the main thread before any worker exists
   // (so the first workers can't race on it) and fail fast if BOSS can't start.
   // The context serves only that one-time init, so it is destroyed right away;
@@ -750,7 +1137,15 @@ int main() {
     boss::BossContextGuard const guard {warmup};
   }
 
-  constexpr auto mcpPort = 5080;
+  // Our WebSocket send path writes to raw sockets; ignore SIGPIPE so a peer
+  // that vanished mid-write cannot take the process down.
+  std::signal(SIGPIPE, SIG_IGN);
+
+  auto port = 5080;
+  for(auto argument = 1; argument < argc; ++argument)
+    if(std::string_view {argv[argument]} == "--port" && argument + 1 < argc)
+      port = std::atoi(argv[++argument]);
+
   runServer(
       [](std::string const& expression) -> boss::EvalResult {
         auto& worker = currentWorker();
@@ -758,6 +1153,6 @@ int main() {
           return {true, "failed to initialise a BOSS context for this worker thread"};
         return boss::evaluate_expression(worker.context(), worker.environment(), expression);
       },
-      mcpPort);
+      port);
   return 0;
 }

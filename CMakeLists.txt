@@ -99,13 +99,16 @@ ExternalProject_Add(libmicrohttpd
     --disable-doc
     --disable-examples
     --without-gnutls
+    --enable-experimental
   BUILD_COMMAND ${MAKE_EXECUTABLE}
   INSTALL_COMMAND ${MAKE_EXECUTABLE} install
   LOG_CONFIGURE ON
   LOG_BUILD ON
   LOG_INSTALL ON
   LOG_OUTPUT_ON_FAILURE ON
-  BUILD_BYPRODUCTS ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd.a
+  BUILD_BYPRODUCTS
+    ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd.a
+    ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd_ws.a
 )
 
 ExternalProject_Add(nlohmann-json
@@ -144,6 +147,7 @@ target_link_libraries(McPike
   ${BOSS_LIBRARY}
   ${CHIBI_LIBRARY}
   ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd.a
+  ${CMAKE_BINARY_DIR}/deps/lib/libmicrohttpd_ws.a
   Threads::Threads)
 
 set_target_properties(McPike PROPERTIES

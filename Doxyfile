@@ -1,0 +1,10 @@
+      PROJECT_NAME     = "McPike"
+      INPUT            = Source
+      FILE_PATTERNS    = *.cpp *.hpp
+      RECURSIVE        = YES
+      EXTRACT_ALL      = YES        # document even undocumented symbols
+      GENERATE_HTML    = YES
+      GENERATE_LATEX   = NO
+      OUTPUT_DIRECTORY = docs
+      HAVE_DOT         = NO        # only if graphviz is installed
+EXTRACT_ANON_NSPACES = YES
